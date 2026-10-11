@@ -2,6 +2,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
+#include <QHash>
 #include <QObject>
 #include <QPointer>
 #include <QUrl>
@@ -12,6 +13,13 @@ struct ApiReply {
     QByteArray body;
     QUrl location;
     QString error;
+    QByteArray etag;
+    bool notModified = false;   // 由 304 + 本機快取還原（不計入 GitHub 限流）
+    int rateRemaining = -1;
+    qint64 rateReset = 0;       // epoch 秒
+    int retryAfter = 0;         // 秒
+    // 若本次回應是限流，回傳建議等待秒數；否則 0
+    int rateLimitWaitSeconds() const;
     QJsonObject object() const { return QJsonDocument::fromJson(body).object(); }
 };
 
@@ -42,8 +50,9 @@ public:
 private:
     QUrl repoUrl(const QString& suffix) const;
     void request(const QByteArray& method, const QUrl& url, const QByteArray& body, Callback cb,
-                 bool github = true);
+                 bool github = true, bool cacheable = false);
 
     QNetworkAccessManager m_nam;
+    QHash<QString, QPair<QByteArray, QByteArray>> m_etagCache; // url -> (etag, body)
     QPointer<QNetworkReply> m_download;
 };

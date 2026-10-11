@@ -27,6 +27,8 @@ jobs:
           version: '6.11.2'
           arch: win64_msvc2022_64
           cache: true
+          # aqtinstall 3.3.0 不支援 Qt 6.11 的目錄結構，改用含修正的 commit（待 3.4.0 釋出後可移除）
+          aqtsource: 'git+https://github.com/miurahr/aqtinstall.git@151f6f436c2f5a5ceb7890ad970ca6f3b4d83512'
 
       - name: 設定 MSVC 環境
         uses: ilammy/msvc-dev-cmd@v1
