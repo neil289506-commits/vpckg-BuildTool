@@ -1,0 +1,94 @@
+name: build-client
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 只給 tag 發布 Release 用（GITHUB_TOKEN，不是你的 PAT）
+
+jobs:
+  build:
+    # fork 的 PR 拿不到 Secret，直接略過
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安裝 Qt 6.11.2 (MSVC 2022)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.11.2'
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: 設定 MSVC 環境
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: 由 Repo Secret 產生 PAT 模組
+        env:
+          ATCOMPILE_PAT: ${{ secrets.ATCOMPILE_PAT }}
+        run: |
+          if (-not $env:ATCOMPILE_PAT) { throw "Repo Secret ATCOMPILE_PAT 是空的" }
+          .\tools\gen-pat.ps1 -Pat $env:ATCOMPILE_PAT | Out-Null
+          if (-not (Test-Path secret\PatProvider_private.cpp)) { throw "PAT 模組產生失敗" }
+
+      - name: 編譯 Client
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR"
+          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
+          cmake --build build
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+
+      - name: 移除私有 PAT 原始碼
+        if: always()
+        run: Remove-Item secret\PatProvider_private.cpp -Force -ErrorAction SilentlyContinue
+
+      - name: windeployqt 整理
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item build\VcpkgCompileTool.exe dist\
+          & "$env:QT_ROOT_DIR\bin\windeployqt.exe" --release --no-translations dist\VcpkgCompileTool.exe
+          if ($LASTEXITCODE -ne 0) { throw "windeployqt failed" }
+
+      - name: 檢查成品沒有明文 PAT
+        run: |
+          $bad = Get-ChildItem dist -Recurse -File | Where-Object {
+            [Text.Encoding]::Latin1.GetString([IO.File]::ReadAllBytes($_.FullName)).Contains('github_pat_')
+          }
+          if ($bad) { throw "成品內含明文 PAT：$($bad.FullName -join ', ')" }
+
+      - name: 取得並打包 vcpkg（含 vcpkg.exe）
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg-src
+          if ($LASTEXITCODE -ne 0) { throw "git clone failed" }
+          .\vcpkg-src\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap failed" }
+          foreach ($d in '.git','downloads','buildtrees','packages') {
+            if (Test-Path "vcpkg-src\$d") { cmd /c rmdir /s /q "vcpkg-src\$d" }
+          }
+          tar -a -c -f vcpkg-bundle.zip -C vcpkg-src .
+          if ($LASTEXITCODE -ne 0) { throw "zip failed" }
+          Compress-Archive -Path dist\* -DestinationPath VcpkgCompileTool-win64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VcpkgCompileTool-win64
+          path: |
+            VcpkgCompileTool-win64.zip
+            vcpkg-bundle.zip
+          retention-days: 14
+
+      - name: 發布 Release（僅 tag）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            VcpkgCompileTool-win64.zip
+            vcpkg-bundle.zip
