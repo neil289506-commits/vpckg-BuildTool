@@ -1,0 +1,102 @@
+name: vcpkg-compile
+run-name: "vcpkg ${{ inputs.package }}:${{ inputs.triplet }} [${{ inputs.client_id }}]"
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "vcpkg port name"
+        required: true
+        type: string
+      triplet:
+        description: "Triplet"
+        required: true
+        default: "x64-windows"
+        type: string
+      features:
+        description: "Comma separated features"
+        required: false
+        default: ""
+        type: string
+      extra_args:
+        description: "Extra vcpkg install arguments"
+        required: false
+        default: ""
+        type: string
+      client_id:
+        description: "Client correlation id"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  build:
+    name: build
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      # 一律經由環境變數傳入，避免 script injection
+      PKG: ${{ inputs.package }}
+      TRIPLET: ${{ inputs.triplet }}
+      FEATURES: ${{ inputs.features }}
+      EXTRA: ${{ inputs.extra_args }}
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+      VCPKG_DISABLE_METRICS: "1"
+    steps:
+      - name: 驗證參數
+        run: |
+          if ($env:PKG -notmatch '^[a-z0-9][a-z0-9\-]*$') { throw "invalid package" }
+          if ($env:TRIPLET -notmatch '^[a-z0-9\-]+$') { throw "invalid triplet" }
+          if ($env:FEATURES -notmatch '^[a-z0-9\-,]*$') { throw "invalid features" }
+          if ($env:EXTRA -notmatch '^[A-Za-z0-9 _\-=.:/\[\]]*$') { throw "invalid extra args" }
+
+      - name: 取得 vcpkg
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg.git vcpkg
+          if ($LASTEXITCODE -ne 0) { throw "git clone failed" }
+
+      - name: 初始化 vcpkg
+        run: |
+          .\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap failed" }
+
+      - name: 編譯函式庫
+        run: |
+          $spec = $env:PKG
+          if ($env:FEATURES) { $spec += "[" + $env:FEATURES + "]" }
+          $spec += ":" + $env:TRIPLET
+          $extra = @($env:EXTRA -split '\s+' | Where-Object { $_ })
+          .\vcpkg\vcpkg.exe install $spec @extra
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
+
+      - name: 清理中間產物
+        run: |
+          $root = Join-Path $env:GITHUB_WORKSPACE 'vcpkg'
+          foreach ($d in 'buildtrees','downloads','packages','tools','.git') {
+            $p = Join-Path $root $d
+            if (Test-Path $p) { cmd /c rmdir /s /q "$p" }
+          }
+
+      - name: 打包並上傳
+        uses: actions/upload-artifact@v4
+        with:
+          name: vcpkg-${{ inputs.client_id }}
+          path: vcpkg
+          include-hidden-files: true
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: 失敗時上傳 log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ inputs.client_id }}
+          path: vcpkg/buildtrees/**/*.log
+          retention-days: 1
+          if-no-files-found: ignore

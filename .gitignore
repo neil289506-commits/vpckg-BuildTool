@@ -1,0 +1,8 @@
+build/
+out/
+dist/
+vcpkg-src/
+CMakeUserPresets.json
+*.user
+# 不開源的 PAT 實作 —— 絕對不要提交（CI 會從 Repo Secret 產生）
+secret/PatProvider_private.cpp
