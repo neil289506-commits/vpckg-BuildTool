@@ -2,6 +2,7 @@
 #include "GitHubClient.h"
 
 #include <QList>
+#include <QElapsedTimer>
 #include <QObject>
 #include <QTimer>
 
@@ -44,6 +45,7 @@ private:
     void fetchLogs(int gen);
     void onRunCompleted(const QString& conclusion);
     void fetchArtifact(int gen, bool success, int attempt);
+    bool pauseIfRateLimited(const ApiReply& r, int gen);
     void fail(const QString& message);
     void finish(bool ok, const QString& message, const QString& file);
     QString describe(const ApiReply& r, const QString& prefix) const;
@@ -51,6 +53,7 @@ private:
 
     GitHubClient m_gh;
     QTimer m_timer;
+    QElapsedTimer m_elapsed;
     BuildRequest m_req;
     QString m_clientId;
     QString m_branch;

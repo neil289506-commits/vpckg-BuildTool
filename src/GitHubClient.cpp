@@ -2,10 +2,22 @@
 #include "Config.h"
 #include "PatProvider.h"
 
+#include <QDateTime>
 #include <QFile>
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <memory>
+
+int ApiReply::rateLimitWaitSeconds() const
+{
+    const bool limited = status == 429 || (status == 403 && (rateRemaining == 0 || retryAfter > 0));
+    if (!limited)
+        return 0;
+    if (retryAfter > 0)
+        return retryAfter;
+    const qint64 wait = rateReset - QDateTime::currentSecsSinceEpoch();
+    return wait > 0 ? int(wait) : 60;
+}
 
 GitHubClient::GitHubClient(QObject* parent) : QObject(parent)
 {
@@ -20,8 +32,9 @@ QUrl GitHubClient::repoUrl(const QString& suffix) const
 }
 
 void GitHubClient::request(const QByteArray& method, const QUrl& url, const QByteArray& body,
-                           Callback cb, bool github)
+                           Callback cb, bool github, bool cacheable)
 {
+    const QString cacheKey = url.toString();
     QNetworkRequest req(url);
     req.setRawHeader("User-Agent", "VcpkgCompileTool");
     if (github) {
@@ -30,17 +43,41 @@ void GitHubClient::request(const QByteArray& method, const QUrl& url, const QByt
         req.setRawHeader("Authorization", "Bearer " + PatProvider::token().toUtf8());
     }
     req.setTransferTimeout(30000);
+    // 條件式請求：帶 Authorization 且回 304 時不計入主要限流
+    if (cacheable && github && method == "GET") {
+        const auto it = m_etagCache.constFind(cacheKey);
+        if (it != m_etagCache.constEnd())
+            req.setRawHeader("If-None-Match", it->first);
+    }
     if (!body.isEmpty())
         req.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
 
     QNetworkReply* rep = (method == "GET") ? m_nam.get(req) : m_nam.sendCustomRequest(req, method, body);
-    connect(rep, &QNetworkReply::finished, this, [rep, cb]() {
+    connect(rep, &QNetworkReply::finished, this, [this, rep, cb, cacheKey, cacheable, github]() {
         ApiReply r;
         r.status = rep->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         r.body = rep->readAll();
         r.location = rep->header(QNetworkRequest::LocationHeader).toUrl();
+        r.etag = rep->rawHeader("ETag");
+        const QByteArray rem = rep->rawHeader("x-ratelimit-remaining");
+        if (!rem.isEmpty())
+            r.rateRemaining = rem.toInt();
+        r.rateReset = rep->rawHeader("x-ratelimit-reset").toLongLong();
+        r.retryAfter = rep->rawHeader("retry-after").toInt();
         if (r.status == 0)
             r.error = rep->errorString();
+        if (cacheable && github) {
+            if (r.status == 304) {
+                const auto it = m_etagCache.constFind(cacheKey);
+                if (it != m_etagCache.constEnd()) {
+                    r.body = it->second;
+                    r.status = 200;
+                    r.notModified = true;
+                }
+            } else if (r.status == 200 && !r.etag.isEmpty()) {
+                m_etagCache.insert(cacheKey, {r.etag, r.body});
+            }
+        }
         rep->deleteLater();
         cb(r);
     });
@@ -70,6 +107,7 @@ void GitHubClient::dispatch(const QString& ref, const QJsonObject& inputs, Callb
     QJsonObject o;
     o.insert(QStringLiteral("ref"), ref);
     o.insert(QStringLiteral("inputs"), inputs);
+    o.insert(QStringLiteral("return_run_details"), true); // 200 + workflow_run_id（2026-02 起支援）
     request("POST", repoUrl(QStringLiteral("/actions/workflows/%1/dispatches").arg(Config::kWorkflowFile)),
             QJsonDocument(o).toJson(QJsonDocument::Compact), std::move(cb));
 }
@@ -77,19 +115,19 @@ void GitHubClient::dispatch(const QString& ref, const QJsonObject& inputs, Callb
 void GitHubClient::listRuns(Callback cb)
 {
     request("GET",
-            repoUrl(QStringLiteral("/actions/workflows/%1/runs?event=workflow_dispatch&per_page=20")
+            repoUrl(QStringLiteral("/actions/workflows/%1/runs?event=workflow_dispatch&per_page=100")
                         .arg(Config::kWorkflowFile)),
             {}, std::move(cb));
 }
 
 void GitHubClient::getRun(qint64 runId, Callback cb)
 {
-    request("GET", repoUrl(QStringLiteral("/actions/runs/%1").arg(runId)), {}, std::move(cb));
+    request("GET", repoUrl(QStringLiteral("/actions/runs/%1").arg(runId)), {}, std::move(cb), true, true);
 }
 
 void GitHubClient::getJobs(qint64 runId, Callback cb)
 {
-    request("GET", repoUrl(QStringLiteral("/actions/runs/%1/jobs").arg(runId)), {}, std::move(cb));
+    request("GET", repoUrl(QStringLiteral("/actions/runs/%1/jobs").arg(runId)), {}, std::move(cb), true, true);
 }
 
 void GitHubClient::cancelRun(qint64 runId, Callback cb)

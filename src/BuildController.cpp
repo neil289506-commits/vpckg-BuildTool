@@ -49,6 +49,8 @@ void BuildController::start(const BuildRequest& req)
     m_tick = 0;
     m_pollBusy = false;
     m_logBusy = false;
+    m_elapsed.start();
+    m_timer.setInterval(4000);
     m_clientId = QUuid::createUuid().toString(QUuid::Id128).left(12);
 
     emit progressChanged(0);
@@ -123,10 +125,23 @@ void BuildController::dispatchRun(int gen, int attempt)
     m_gh.dispatch(m_branch, inputs, [this, gen, attempt](const ApiReply& r) {
         if (gen != m_gen)
             return;
-        if (r.status == 204) {
-            emit phaseChanged(QStringLiteral("已觸發，等待 GitHub 建立 run…"));
+        if (r.status == 200 || r.status == 204) {
+            // 200：return_run_details 直接給 run id（不需要列舉 runs）；204：舊行為，之後以 client_id 比對
+            const qint64 id = r.object().value(QStringLiteral("workflow_run_id")).toInteger();
+            if (id > 0)
+                m_runId = id;
+            emit phaseChanged(m_runId ? QStringLiteral("已觸發，雲端工作已建立…")
+                                      : QStringLiteral("已觸發，等待 GitHub 建立 run…"));
             m_timer.start();
             QTimer::singleShot(1500, this, [this]() { poll(); });
+            return;
+        }
+        if (const int w = r.rateLimitWaitSeconds(); w > 0 && attempt < 6) {
+            emit phaseChanged(QStringLiteral("GitHub API 限流中，約 %1 秒後重試…").arg(qMin(w, 300)));
+            QTimer::singleShot(qMin(w, 300) * 1000 + 1000, this, [this, gen, attempt]() {
+                if (gen == m_gen)
+                    dispatchRun(gen, attempt + 1);
+            });
             return;
         }
         // 剛推送 yml 後，GitHub 可能還沒索引到 workflow_dispatch 觸發器
@@ -147,10 +162,17 @@ void BuildController::poll()
         return;
     m_pollBusy = true;
     const int gen = m_gen;
+    // 越久越慢：前 2 分鐘 4 秒、之後 6 秒、10 分鐘後 10 秒（長時間編譯不需要高頻）
+    const qint64 sec = m_elapsed.elapsed() / 1000;
+    const int want = sec < 120 ? 4000 : (sec < 600 ? 6000 : 10000);
+    if (m_timer.interval() != want)
+        m_timer.setInterval(want);
 
     if (m_runId == 0) {
         m_gh.listRuns([this, gen](const ApiReply& r) {
             if (gen != m_gen)
+                return;
+            if (pauseIfRateLimited(r, gen))
                 return;
             m_pollBusy = false;
             const QJsonArray runs = r.object().value(QStringLiteral("workflow_runs")).toArray();
@@ -170,6 +192,8 @@ void BuildController::poll()
     m_gh.getRun(m_runId, [this, gen](const ApiReply& r) {
         if (gen != m_gen)
             return;
+        if (pauseIfRateLimited(r, gen))
+            return;
         if (r.status != 200) { // 暫時性錯誤，下一輪再試
             m_pollBusy = false;
             return;
@@ -179,6 +203,8 @@ void BuildController::poll()
         const QString conclusion = ro.value(QStringLiteral("conclusion")).toString();
         m_gh.getJobs(m_runId, [this, gen, status, conclusion](const ApiReply& jr) {
             if (gen != m_gen)
+                return;
+            if (pauseIfRateLimited(jr, gen))
                 return;
             m_pollBusy = false;
             if (jr.status == 200)
@@ -225,7 +251,7 @@ void BuildController::applyJobs(const QJsonObject& jobsObj)
     if (!current.isEmpty())
         emit phaseChanged(QStringLiteral("雲端執行中：") + current);
 
-    if (job.value(QStringLiteral("status")).toString() == QLatin1String("in_progress") && (m_tick++ % 2 == 0))
+    if (job.value(QStringLiteral("status")).toString() == QLatin1String("in_progress") && (m_tick++ % 8 == 0))
         fetchLogs(m_gen);
 }
 
@@ -330,6 +356,22 @@ void BuildController::fetchArtifact(int gen, bool success, int attempt)
                     finish(false, QStringLiteral("編譯失敗，log 已下載到：\n") + dest, dest);
             });
     });
+}
+
+bool BuildController::pauseIfRateLimited(const ApiReply& r, int gen)
+{
+    const int w = r.rateLimitWaitSeconds();
+    if (w <= 0)
+        return false;
+    m_pollBusy = false;
+    m_timer.stop();
+    const int wait = qMin(w, 900);
+    emit phaseChanged(QStringLiteral("GitHub API 限流中，約 %1 秒後自動繼續…").arg(wait));
+    QTimer::singleShot(wait * 1000 + 1000, this, [this, gen]() {
+        if (gen == m_gen && m_busy)
+            m_timer.start();
+    });
+    return true;
 }
 
 void BuildController::cancel()
